@@ -20,6 +20,9 @@
 
 #include "NetworkInterface.h"
 #include "InetAddress.h"
+#include "Context.h"
+#include "ContentResolver.h"
+#include "Build.h"
 
 #include "jutils-details.hpp"
 
@@ -70,6 +73,136 @@ std::vector<char> CJNINetworkInterface::getHardwareAddress() const
 
     result.resize(size);
     env->GetByteArrayRegion(array.get(), 0, size, (jbyte*)result.data());
+    
+    // Check if this is a randomized/generic MAC address (02:00:00:00:00:00)
+    // Android 10+ returns this for privacy reasons
+    if (result.size() >= 6 && 
+        result[0] == 0x02 && result[1] == 0x00 && 
+        result[2] == 0x00 && result[3] == 0x00 &&
+        result[4] == 0x00 && result[5] == 0x00)
+    {
+      // Generate a stable pseudo-MAC address based on Android_ID + device info
+      try
+      {
+        // Get Android_ID from Settings.Secure
+        jhclass settingsSecureClass = find_class("android/provider/Settings$Secure");
+        if (settingsSecureClass.get())
+        {
+          CJNIContentResolver contentResolver = CJNIContext::getContentResolver();
+          
+          jmethodID getStringMethod = env->GetStaticMethodID(
+            settingsSecureClass.get(),
+            "getString",
+            "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;"
+          );
+          
+          jstring androidIdKey = env->NewStringUTF("android_id");
+          jstring androidIdValue = (jstring)env->CallStaticObjectMethod(
+            settingsSecureClass.get(),
+            getStringMethod,
+            contentResolver.get_raw().get(),
+            androidIdKey
+          );
+          
+          std::string androidId = "unknown";
+          if (androidIdValue && !env->ExceptionCheck())
+          {
+            androidId = jcast<std::string>(jhstring(androidIdValue));
+          }
+          else
+          {
+            env->ExceptionClear();
+          }
+          
+          if (androidIdKey)
+            env->DeleteLocalRef(androidIdKey);
+          if (androidIdValue)
+            env->DeleteLocalRef(androidIdValue);
+          
+          // Create seed from Android_ID + manufacturer + model
+          std::string seed = androidId + CJNIBuild::MANUFACTURER + CJNIBuild::MODEL;
+          
+          // Use MessageDigest to hash the seed to SHA-256
+          jhclass messageDigestClass = find_class("java/security/MessageDigest");
+          if (messageDigestClass.get())
+          {
+            jmethodID getInstanceMethod = env->GetStaticMethodID(
+              messageDigestClass.get(),
+              "getInstance",
+              "(Ljava/lang/String;)Ljava/security/MessageDigest;"
+            );
+            
+            jstring sha256Str = env->NewStringUTF("SHA-256");
+            jobject digest = env->CallStaticObjectMethod(
+              messageDigestClass.get(),
+              getInstanceMethod,
+              sha256Str
+            );
+            
+            if (sha256Str)
+              env->DeleteLocalRef(sha256Str);
+            
+            if (digest && !env->ExceptionCheck())
+            {
+              // Convert seed to byte array
+              jstring seedString = env->NewStringUTF(seed.c_str());
+              jclass stringClass = env->FindClass("java/lang/String");
+              jmethodID getBytesMethod = env->GetMethodID(
+                stringClass,
+                "getBytes",
+                "()[B"
+              );
+              jbyteArray seedBytes = (jbyteArray)env->CallObjectMethod(seedString, getBytesMethod);
+              
+              if (seedString)
+                env->DeleteLocalRef(seedString);
+              
+              // Digest the seed
+              jmethodID digestMethod = env->GetMethodID(
+                messageDigestClass.get(),
+                "digest",
+                "([B)[B"
+              );
+              jbyteArray hashBytes = (jbyteArray)env->CallObjectMethod(digest, digestMethod, seedBytes);
+              
+              if (seedBytes)
+                env->DeleteLocalRef(seedBytes);
+              
+              if (hashBytes && !env->ExceptionCheck())
+              {
+                // Take first 6 bytes for MAC address
+                jsize hashSize = env->GetArrayLength(hashBytes);
+                if (hashSize >= 6)
+                {
+                  result.resize(6);
+                  env->GetByteArrayRegion(hashBytes, 0, 6, (jbyte*)result.data());
+                  
+                  // Mark as "locally administered" MAC address
+                  // Set bit 1 (second LSB) and clear bit 0 (LSB) of first byte
+                  result[0] = (result[0] & 0xFE) | 0x02;
+                }
+                
+                env->DeleteLocalRef(hashBytes);
+              }
+              else
+              {
+                env->ExceptionClear();
+              }
+              
+              env->DeleteLocalRef(digest);
+            }
+            else
+            {
+              env->ExceptionClear();
+            }
+          }
+        }
+      }
+      catch (...)
+      {
+        // If pseudo-MAC generation fails, keep the original randomized MAC
+      }
+    }
   }
 
   return result;
